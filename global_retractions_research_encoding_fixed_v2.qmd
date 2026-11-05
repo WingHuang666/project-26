@@ -1,0 +1,838 @@
+---
+
+title: "Global Academic Retractions: Predictive Modeling and Research Patterns"
+subtitle: "Five Research Questions | Text-Aware Machine Learning | Model Comparison"
+
+---
+
+## 1. Research Scope and Setup
+
+This project examines **retracted publications only**. It cannot estimate the risk of retraction among *all* published articles because non-retracted articles are absent. Dates are checked rather than assuming the filename's 2000–2025 range is exact. The models are retrospective descriptions of already-retracted records, not prospective screening tools. In particular, retraction reasons are recorded at or after the retraction and must not be treated as information available at initial publication.
+
+**Data input:** The dataset is split across `global_academic_retractions_2000_2025_1.csv` and `global_academic_retractions_2000_2025_2.csv`. The setup cell checks their headers and concatenates all rows before any analysis. Run the QMD from the folder containing both CSV files.
+
+**Research questions**
+
+1. **RQ1:** How well can we explain and predict the time from publication to retraction using publication characteristics? (Regression)
+2. **RQ2:** How accurately can recorded misconduct status be classified from retraction metadata *excluding explicit reason labels*? (Binary classification)
+3. **RQ3:** How well can the presence of a data-related retraction reason be classified from other metadata *excluding all retraction reasons*? (Binary classification)
+4. **RQ4:** Can publication characteristics predict whether a retracted article belongs to a biomedical/health-related primary subject? (Binary classification; interpret as subject differentiation, not causal prediction)
+5. **RQ5:** What distinct profiles of retracted papers emerge from unsupervised clustering? (K-means; elbow and silhouette jointly)
+
+RQ2 and RQ3 are **retrospective associations** rather than early-warning forecasts. RQ4 measures differences among fields and should not be interpreted as a meaningful way to discover an article's subject if its subject is already known.
+
+
+## Handling file formats
+```{python}
+# Install if needed: pip install openpyxl
+
+from pathlib import Path
+import zipfile
+import pandas as pd
+
+path = Path("global_academic_retractions_2000_2025_2.csv")
+
+with zipfile.ZipFile(path) as z:
+    names = z.namelist()
+    print("Internal files:", names[:15])
+
+if "xl/workbook.xml" in names:
+    print("Detected: Excel workbook")
+
+    df2 = pd.read_excel(path, engine="openpyxl")
+
+    print("Shape:", df2.shape)
+    print("Columns:", df2.columns.tolist())
+
+    output = Path("global_academic_retractions_2000_2025_2_fixed.csv")
+
+    df2.to_csv(
+        output,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    print("Saved:", output)
+else:
+    print("Not a standard Excel workbook.")
+    print("Please inspect the internal files above.")
+```
+
+
+
+```{python}
+
+parts = [
+    pd.read_csv(
+        "global_academic_retractions_2000_2025_1.csv",
+        encoding="utf-8-sig",
+        low_memory=False
+    ),
+    pd.read_csv(
+        "global_academic_retractions_2000_2025_2.csv",
+        encoding="utf-8-sig",
+        low_memory=False
+    )
+]
+
+assert parts[0].columns.tolist() == parts[1].columns.tolist(), (
+    "CSV column structures do not match."
+)
+
+df = pd.concat(parts, ignore_index=True)
+
+print("Part 1:", parts[0].shape)
+print("Part 2:", parts[1].shape)
+print("Combined:", df.shape)
+
+
+
+```
+
+
+## input data
+```{python}
+# Install if needed: pip install pandas numpy scipy scikit-learn matplotlib seaborn
+from pathlib import Path
+import re, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import sparse
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, RandomForestClassifier, ExtraTreesClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
+                             average_precision_score, roc_auc_score, f1_score,
+                             balanced_accuracy_score, precision_recall_curve,
+                             ConfusionMatrixDisplay, silhouette_score)
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MultiLabelBinarizer
+from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
+
+RANDOM_STATE = 42
+# Place both CSV parts in the same directory as this QMD file.
+# Each part must contain the same header and a different subset of rows.
+DATA_FILES = [
+    Path('global_academic_retractions_2000_2025_1.csv'),
+    Path('global_academic_retractions_2000_2025_2.csv'),
+]
+missing_files = [str(p) for p in DATA_FILES if not p.is_file()]
+if missing_files:
+    raise FileNotFoundError(
+        'Missing CSV part(s): ' + ', '.join(missing_files) +
+        '. Put both CSV files next to the QMD and run from that directory.'
+    )
+
+def read_csv_preserving_text(path):
+    """Try common CSV encodings without silently dropping undecodable text."""
+    with path.open('rb') as handle:
+        sample = handle.read(4096)
+    if sample.startswith((b'\xff\xfe', b'\xfe\xff')):
+        candidates = ['utf-16']
+    elif sample.startswith(b'\xef\xbb\xbf'):
+        candidates = ['utf-8-sig']
+    elif sample[:200].count(b'\x00') > 10:
+        candidates = ['utf-16-le', 'utf-16-be']
+    else:
+        candidates = ['utf-8-sig', 'cp1252']
+
+    for encoding in candidates:
+        try:
+            frame = pd.read_csv(path, encoding=encoding, low_memory=False)
+            # A successful decode alone is not proof of correct encoding.
+            # Reject obvious misreads of the header.
+            if len(frame.columns) < 2 or any('\x00' in str(c) for c in frame.columns):
+                continue
+            print(f'{path.name}: read using {encoding}; shape={frame.shape}')
+            return frame
+        except (UnicodeError, pd.errors.ParserError):
+            continue
+    raise ValueError(f'Could not reliably read {path.name}. Check its source encoding and delimiter.')
+
+parts = [read_csv_preserving_text(path) for path in DATA_FILES]
+first_columns = parts[0].columns.tolist()
+for path, part in zip(DATA_FILES, parts):
+    if part.columns.tolist() != first_columns:
+        raise ValueError(
+            f'{path.name} has different columns or column order. '
+            'Both files must have identical headers.'
+        )
+    print(f'Loaded {path.name}: {len(part):,} rows, {len(part.columns)} columns')
+
+# Combine vertically; do not remove duplicate-looking records automatically.
+# Genuine separate records may have matching publication metadata.
+raw = pd.concat(parts, axis=0, ignore_index=True)
+assert len(raw) == sum(len(part) for part in parts), 'Row count mismatch after merging.'
+print(f'Merged {len(parts)} files successfully.')
+
+OUTPUT = Path('retractions_outputs')
+OUTPUT.mkdir(exist_ok=True)
+sns.set_theme(style='whitegrid')
+print('Dataset shape:', raw.shape)
+print(raw.dtypes.to_string())
+display(raw.head(3))
+```
+
+## 2. Data Audit: Text Variables and Multi-Value Cells
+
+A semicolon-delimited cell is a **set of labels**, not one indivisible category. We preserve each label using multi-hot indicators for structured multi-label fields. Paper titles are represented by TF-IDF when appropriate. DOI and record IDs are identifiers, not predictors; authors are inspected but excluded from predictive features to avoid high-cardinality memorization and privacy-related author ranking. We also retain raw text for auditability.
+
+```{python}
+text_cols = raw.select_dtypes(include=['object', 'string']).columns.tolist()
+audit = []
+for c in text_cols:
+    v = raw[c].dropna().astype(str)
+    audit.append({'variable': c, 'unique_values': v.nunique(),
+                  'missing_pct': round(raw[c].isna().mean()*100, 2),
+                  'semicolon_cells_pct': round(v.str.contains(';', regex=False).mean()*100, 2),
+                  'avg_chars': round(v.str.len().mean(), 1),
+                  'sample': v.iloc[0][:110] if len(v) else ''})
+audit_df = pd.DataFrame(audit).sort_values('semicolon_cells_pct', ascending=False)
+display(audit_df)
+audit_df.to_csv(OUTPUT/'text_variable_audit.csv', index=False)
+```
+
+```{python}
+def split_labels(value):
+    if pd.isna(value): return []
+    return list(dict.fromkeys(x.strip() for x in str(value).split(';') if x.strip()))
+
+multi_cols = ['subject_areas', 'country', 'authors', 'article_type', 'retraction_reasons']
+for c in multi_cols:
+    counts = raw[c].map(lambda v: len(split_labels(v)))
+    print(f'{c}: {counts.gt(1).sum():,} multi-value cells; max {counts.max()} labels/cell')
+    labels = pd.Series([item for v in raw[c] for item in split_labels(v)])
+    print(labels.value_counts().head(8).to_string(), '\n')
+```
+
+
+
+### Multi-Value Text Variable Analysis
+
+The dataset contains a substantial number of multi-value text variables, particularly in `subject_areas`, `country`, and `authors`. Among the 65,909 records, 57,047 (86.55%) contain multiple subject areas, 10,341 (15.69%) involve multiple countries, and 55,174 (83.71%) list multiple authors. Some records contain up to 10 subject areas, 28 countries, or 88 authors.
+
+The most frequently represented subject areas include Technology, Cellular Biology, Computer Science, and Genetics. China accounts for the largest number of country mentions (36,501), followed by India and the United States. Common retraction reasons include Limited or No Information, Paper Mill, and Concerns about Peer Review.
+
+These findings highlight the importance of preserving information contained within multi-value text fields. Multi-hot encoding is appropriate for subject areas, countries, and retraction reasons, while author counts and other aggregated features can represent authorship information without creating excessively high-dimensional variables. TF-IDF can also be applied to article titles when textual content is relevant to a research question.
+
+Overall, appropriate text preprocessing allows the analysis to retain valuable information about research disciplines, international collaboration, authorship patterns, and retraction reasons. However, potential data leakage must be considered, particularly when using retraction reasons to predict misconduct. Additionally, country-level counts represent mentions rather than mutually exclusive records, and the dataset cannot establish country-specific retraction rates without information about all published papers.
+
+
+
+## 3. Data Cleaning, Quality Checks and EDA
+
+Check missingness, duplicates, publication/retraction dates, and inconsistencies in duration. Negative or invalid durations are excluded from duration modeling. A DOI can appear in more than one record, so duplicate IDs and DOI frequencies are reported rather than blindly dropping them. All plots below have an explicit research purpose.
+
+```{python}
+df = raw.copy()
+for c in ['original_paper_date', 'retraction_date']:
+    df[c] = pd.to_datetime(df[c], errors='coerce')
+df['computed_days'] = (df['retraction_date'] - df['original_paper_date']).dt.days
+df['duration_days'] = pd.to_numeric(df['days_to_retraction'], errors='coerce')
+df['duration_disagreement'] = (df['duration_days']-df['computed_days']).abs().gt(1)
+df['publication_year'] = df['original_paper_date'].dt.year
+df['retraction_year'] = df['retraction_date'].dt.year
+df['n_subjects'] = df['subject_areas'].map(lambda x: len(split_labels(x)))
+df['n_countries'] = df['country'].map(lambda x: len(split_labels(x)))
+df['n_article_types'] = df['article_type'].map(lambda x: len(split_labels(x)))
+df['n_reasons'] = df['retraction_reasons'].map(lambda x: len(split_labels(x)))
+df['title_word_count'] = df['title'].fillna('').str.split().str.len()
+df['misconduct_target'] = df['is_misconduct'].astype(int)
+print('Duplicate record IDs:', df['record_id'].duplicated().sum())
+print('Missing values:\n', df.isna().sum().sort_values(ascending=False).head(12))
+print('Date ranges:', df['original_paper_date'].min(), df['original_paper_date'].max(),
+      df['retraction_date'].min(), df['retraction_date'].max())
+print('Negative computed durations:', df['computed_days'].lt(0).sum())
+print('Recorded-vs-computed duration differences >1 day:', df['duration_disagreement'].sum())
+print('Misconduct prevalence:', df['misconduct_target'].mean().round(4))
+```
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13,4))
+df['retraction_year'].value_counts().sort_index().plot(ax=axes[0], title='Retractions by recorded year')
+axes[0].set(xlabel='Retraction year', ylabel='Number of records')
+valid_durations = df.loc[df['computed_days'].ge(0), 'computed_days'].dropna()
+sns.histplot(np.log1p(valid_durations), bins=45, ax=axes[1])
+axes[1].set(xlabel='log(1 + days to retraction)', title='Distribution of retraction delays')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+reason_counts = pd.Series([x for cell in df['retraction_reasons'] for x in split_labels(cell)]).value_counts()
+subject_counts = df['primary_subject'].fillna('Unknown').value_counts()
+fig, axes = plt.subplots(1,2,figsize=(15,6))
+reason_counts.head(12).sort_values().plot.barh(ax=axes[0], title='Most frequently recorded reasons')
+subject_counts.head(12).sort_values().plot.barh(ax=axes[1], title='Most represented primary subjects')
+plt.tight_layout(); plt.show()
+```
+
+
+## Exploratory Data Analysis (EDA)
+
+### 1. Data Quality and Validation
+
+The dataset contains 65,909 retraction records with no duplicate record IDs. Missing values are limited to `original_paper_doi` (2,436 records) and `retraction_doi` (372 records), while the remaining variables are complete.
+
+Date validation shows no negative retraction durations or discrepancies greater than one day between recorded and calculated delays. The original publication dates range from 2000 to 2025, while retraction dates extend into September 2026. Approximately 34.66% of records are classified as misconduct-related.
+
+Overall, the dataset demonstrates good completeness and consistency, making it suitable for further statistical analysis and machine learning.
+
+### 2. Retraction Trends Over Time
+
+The annual number of recorded retractions generally increased over time, with noticeable spikes around 2010–2011 and a particularly sharp peak in 2023, exceeding 13,000 records.
+
+Following this peak, recorded retractions declined substantially. However, this pattern should not automatically be interpreted as an improvement in research integrity, as changes in investigation practices, mass retraction events, reporting coverage, and incomplete recent-year data may influence the observed trends.
+
+### 3. Distribution of Retraction Delays
+
+Retraction delays show a broad and uneven distribution. On the logarithmic scale, most observations are concentrated between approximately 6 and 7, indicating substantial variation in the time required to retract publications.
+
+The distribution also contains shorter-delay groups and a noticeable concentration near zero. This suggests that retraction timing varies considerably across cases and may be influenced by publication characteristics, investigation processes, and retraction reasons.
+
+### 4. Most Frequently Recorded Retraction Reasons
+
+The most frequently recorded reason is *Investigation by Journal/Publisher*, followed by *Unreliable Results and/or Conclusions* and *Investigation by Third Party*.
+
+Other prominent categories include referencing issues, data concerns, paper mills, and peer-review problems. These findings indicate that retractions involve multiple dimensions of research integrity, including unreliable findings, publication-process concerns, and possible misconduct.
+
+Because a single record can contain multiple reasons, category frequencies are not mutually exclusive.
+
+### 5. Distribution Across Academic Disciplines
+
+Computer Science has the highest number of recorded retractions, followed by Biochemistry, Technology, and Cancer Biology. Business-related disciplines and Data Science are also represented.
+
+These differences suggest that recorded retractions are unevenly distributed across academic fields. However, higher counts do not necessarily indicate lower research integrity, since publication volume, disciplinary practices, and detection intensity may differ substantially.
+
+### 6. Overall Findings
+
+The EDA reveals three major patterns: increasing historical retraction activity with significant annual fluctuations, substantial variation in retraction delays, and considerable differences in recorded reasons and academic disciplines.
+
+These findings support further investigation using regression, classification, feature importance analysis, and clustering to identify characteristics associated with retraction timing, misconduct classification, and distinct retraction patterns.
+
+
+
+
+
+## 4. Shared Modeling Utilities and Evaluation Rules
+
+We compare **four candidates** per supervised task: a dummy baseline plus three substantive models. The dummy establishes whether learning adds value, but **all model figures and feature-importance figures use non-dummy models**. Regression uses cross-validated MAE on `log1p(days)` to limit extreme-duration dominance; classification uses cross-validated average precision (PR-AUC), especially useful with unequal class sizes, and reports ROC-AUC, F1 and balanced accuracy as supporting diagnostics. Test sets are untouched until final evaluation. Interpretability uses permutation importance on held-out records, grouping the influence of original input columns, including multi-label text.
+
+The full 65k-record dataset and high-dimensional text can be expensive. The model-ready features deliberately limit vocabularies and tree complexity. All random splits use a fixed seed. These are association analyses; random splits do not establish future-time generalization.
+
+```{python}
+# Transform multi-valued text into space-separated tokens for TF-IDF.
+# Token patterns preserve meaningful multi-word labels via custom tokens.
+def tokenized_labels(s):
+    return ['lbl_' + re.sub(r'[^a-z0-9]+', '_', x.lower()).strip('_')
+            for x in split_labels(s) if x.strip()]
+
+def joined_labels(s):
+    return ' '.join(tokenized_labels(s))
+
+for c in ['subject_areas','country','article_type','retraction_reasons']:
+    df[c+'_tokens'] = df[c].map(joined_labels)
+
+def build_preprocessor(numeric, categorical, multilabel=(), title=False):
+    transformers = []
+    if numeric:
+        transformers.append(('num', Pipeline([
+            ('impute',SimpleImputer(strategy='median', add_indicator=True)),
+            ('scale',StandardScaler())]), numeric))
+    if categorical:
+        transformers.append(('cat',Pipeline([
+            ('impute',SimpleImputer(strategy='constant', fill_value='Unknown')),
+            ('onehot',OneHotEncoder(handle_unknown='ignore', min_frequency=30))]),categorical))
+    for c in multilabel:
+        transformers.append((c, TfidfVectorizer(token_pattern=r'(?u)\b\w+\b',
+                          lowercase=False, binary=True, use_idf=False, norm=None,
+                          max_features=120), c))
+    if title:
+        transformers.append(('title',TfidfVectorizer(stop_words='english', min_df=15,
+                                                      max_features=400, ngram_range=(1,2)), 'title'))
+    return ColumnTransformer(transformers, sparse_threshold=0.3)
+
+BASE_NUM = ['author_count','publication_year','n_subjects','n_countries','n_article_types','title_word_count']
+BASE_CAT = ['journal','publisher','primary_country']
+BASE_MULTI = ['subject_areas_tokens','country_tokens','article_type_tokens']
+# Avoid explicit target proxies: subject is excluded in RQ4, reason labels in RQ2/RQ3.
+
+def candidate_models(task):
+    if task == 'regression':
+        return {'Dummy median':DummyRegressor(strategy='median'),
+                'Ridge':Ridge(alpha=20),
+                'Random Forest':RandomForestRegressor(n_estimators=90,min_samples_leaf=8,
+                                                     max_features=0.7,n_jobs=-1,random_state=RANDOM_STATE),
+                'Extra Trees':ExtraTreesRegressor(n_estimators=90,min_samples_leaf=8,
+                                                 max_features=0.7,n_jobs=-1,random_state=RANDOM_STATE)}
+    return {'Dummy prior':DummyClassifier(strategy='prior'),
+            'Logistic Regression':LogisticRegression(max_iter=1200,class_weight='balanced',solver='liblinear'),
+            'Random Forest':RandomForestClassifier(n_estimators=90,min_samples_leaf=8,
+                                                   max_features=0.7,n_jobs=-1,random_state=RANDOM_STATE),
+            'Extra Trees':ExtraTreesClassifier(n_estimators=90,min_samples_leaf=8,
+                                               max_features=0.7,n_jobs=-1,random_state=RANDOM_STATE)}
+
+def run_question(name, data, target, numeric, categorical, multilabel, task, title=False):
+    cols = list(dict.fromkeys(numeric+categorical+list(multilabel)+(['title'] if title else [])))
+    work = data.loc[data[target].notna(), cols+[target]].copy()
+    X, y = work[cols], work[target]
+    strat = y if task == 'classification' else None
+    X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=0.2,
+                                    random_state=RANDOM_STATE,stratify=strat)
+    prep = build_preprocessor(numeric,categorical,multilabel,title)
+    models = candidate_models('regression' if task=='regression' else 'classification')
+    cv = KFold(3,shuffle=True,random_state=RANDOM_STATE) if task=='regression' else StratifiedKFold(3,shuffle=True,random_state=RANDOM_STATE)
+    scoring = {'MAE':'neg_mean_absolute_error','R2':'r2'} if task=='regression' else {'PR_AUC':'average_precision','ROC_AUC':'roc_auc','Balanced_Accuracy':'balanced_accuracy'}
+    records=[]
+    for label, model in models.items():
+        pipe = Pipeline([('prep',clone(prep)),('model',clone(model))])
+        scores = cross_validate(pipe,X_train,y_train,cv=cv,scoring=scoring,n_jobs=1,error_score='raise')
+        row={'model':label}
+        for metric,values in scores.items():
+            if metric.startswith('test_'):
+                metric=metric[5:]
+                row['CV_'+metric]=round((-values if metric=='MAE' else values).mean(),5)
+        records.append(row)
+    results=pd.DataFrame(records)
+    rank_col='CV_MAE' if task=='regression' else 'CV_PR_AUC'
+    results=results.sort_values(rank_col,ascending=(task=='regression')).reset_index(drop=True)
+    print('\n'+name, '| records:',len(work),'| target prevalence/median:',
+          round(y.mean(),4) if task=='classification' else round(y.median(),3))
+    display(results)
+    results.to_csv(OUTPUT/(name+'_model_comparison.csv'),index=False)
+    best_name=results.iloc[0]['model']
+    best=Pipeline([('prep',clone(prep)),('model',clone(models[best_name]))]).fit(X_train,y_train)
+    pred=best.predict(X_test)
+    if task=='regression':
+        print('Best holdout MAE (log days):',round(mean_absolute_error(y_test,pred),4),
+              'RMSE:',round(np.sqrt(mean_squared_error(y_test,pred)),4),
+              'R2:',round(r2_score(y_test,pred),4))
+    else:
+        prob=best.predict_proba(X_test)[:,1]
+        print('Best holdout PR-AUC:',round(average_precision_score(y_test,prob),4),
+              'ROC-AUC:',round(roc_auc_score(y_test,prob),4),
+              'F1 (threshold 0.5):',round(f1_score(y_test,pred,zero_division=0),4),
+              'Balanced accuracy:',round(balanced_accuracy_score(y_test,pred),4))
+    # For interpretation/plots, use the highest-ranked non-dummy fitted model.
+    non_dummy_name=next(x for x in results['model'] if not x.startswith('Dummy'))
+    interpretable=best if best_name==non_dummy_name else Pipeline([
+        ('prep',clone(prep)),('model',clone(models[non_dummy_name]))]).fit(X_train,y_train)
+    rng=np.random.default_rng(RANDOM_STATE)
+    ix=rng.choice(len(X_test),size=min(1000,len(X_test)),replace=False)
+    X_imp=X_test.iloc[ix]; y_imp=y_test.iloc[ix]
+    scoring_imp='neg_mean_absolute_error' if task=='regression' else 'average_precision'
+    perm=permutation_importance(interpretable,X_imp,y_imp,n_repeats=3,
+                                scoring=scoring_imp,random_state=RANDOM_STATE,n_jobs=1)
+    importance=pd.Series(perm.importances_mean,index=cols).sort_values(ascending=False)
+    display(importance.to_frame('Permutation importance (score decrease)'))
+    importance.to_csv(OUTPUT/(name+'_feature_importance.csv'))
+    fig,axes=plt.subplots(1,2,figsize=(12,4.5))
+    importance.head(12).sort_values().plot.barh(ax=axes[0],title=f'{name}: input-column importance ({non_dummy_name})')
+    if task=='regression':
+        p=interpretable.predict(X_test)
+        axes[1].scatter(y_test,p,s=8,alpha=0.2)
+        lo=min(y_test.min(),p.min()); hi=max(y_test.max(),p.max())
+        axes[1].plot([lo,hi],[lo,hi],ls='--',color='black')
+        axes[1].set(xlabel='Actual log(1+days)',ylabel='Predicted log(1+days)',title='Held-out predictions')
+    else:
+        p=interpretable.predict_proba(X_test)[:,1]
+        precision,recall,_=precision_recall_curve(y_test,p)
+        axes[1].plot(recall,precision,label=f'PR-AUC={average_precision_score(y_test,p):.3f}')
+        axes[1].axhline(y_test.mean(),ls='--',color='gray',label='Class prevalence')
+        axes[1].set(xlabel='Recall',ylabel='Precision',title='Held-out precision–recall curve')
+        axes[1].legend()
+    plt.tight_layout();plt.show()
+    return {'comparison':results,'best_name':best_name,'best_model':best,
+            'interpretation_model':interpretable,'importance':importance}
+```
+
+
+
+
+
+
+## 5. RQ1 — What Predicts Retraction Delay?
+
+**Target:** `log1p(computed_days)`. Use dates to compute duration independently of the supplied duration field. Exclude retraction date, recorded duration, reason labels, misconduct and any variables calculated from the target. The question is **retrospective**, since duration is only known after retraction. MAE on the log scale is the primary criterion, with R² secondary. Reported predictions can be converted to days with `expm1`, but log-scale MAE is not MAE in days.
+
+```{python}
+rq1_df=df.loc[df['computed_days'].ge(0) & df['computed_days'].notna()].copy()
+rq1_df['log_delay']=np.log1p(rq1_df['computed_days'])
+rq1=run_question('RQ1',rq1_df,'log_delay',BASE_NUM,BASE_CAT,BASE_MULTI,'regression',title=True)
+```
+
+
+### RQ1: Retraction Delay Prediction
+
+**Research Question:** Can publication characteristics predict the time between publication and retraction, and which features are most influential?
+
+#### Model Performance
+
+Four regression models were evaluated using cross-validation MAE and R², with the target transformed using log(1 + days to retraction) to reduce skewness.
+
+Extra Trees achieved the best performance, with a cross-validation MAE of 0.5918 and R² of 0.5457, outperforming Random Forest, Ridge, and Dummy Median. On the holdout dataset, Extra Trees achieved an MAE of 0.5931, RMSE of 1.152, and R² of 0.5397.
+
+The model reduced cross-validation MAE by approximately 52.1% compared with Dummy Median. The similarity between cross-validation and holdout results suggests relatively stable generalization under the current data split.
+
+#### Prediction Patterns
+
+The actual-versus-predicted plot shows that predictions are concentrated within the middle range of retraction delays. The model tends to overestimate shorter delays and underestimate longer delays, indicating difficulty capturing extreme cases.
+
+Although Extra Trees demonstrates moderate predictive ability, considerable unexplained variation remains.
+
+#### Feature Importance
+
+Permutation importance identifies Publisher (0.6158) as the most influential feature, followed by Publication Year (0.3266), Journal (0.2109), and Article Type (0.2050).
+
+Subject Areas and Country also contribute to prediction, while Author Count and Title-related features have relatively limited additional importance.
+
+These findings suggest that publication characteristics and institutional publishing environments are strongly associated with retraction timing. However, feature importance reflects predictive contribution rather than causal influence.
+
+#### Limitations and Conclusion
+
+An important limitation is that the dataset contains only retracted publications. More recent papers have shorter observation windows, potentially biasing the relationship between publication year and retraction delay. Additionally, errors are measured on a logarithmic scale, rather than directly in days.
+
+Overall, Extra Trees is the strongest model for RQ1, demonstrating meaningful but moderate predictive performance. Publisher, Publication Year, Journal, and Article Type emerge as the most important predictors, highlighting the relevance of publication characteristics in understanding retraction timing.
+
+
+
+
+
+## 6. RQ2 — Which Metadata Correlate With Recorded Misconduct?
+
+**Target:** `is_misconduct`. Retraction-reason labels are excluded because they may define or nearly determine the target. This is not a prospective misconduct detector; the label is an administrative classification and may reflect reporting practices. PR-AUC is primary; ROC-AUC and balanced accuracy are supplementary. The title may encode disciplinary or topic signals, but not definitive evidence of misconduct.
+
+```{python}
+rq2=run_question('RQ2',df,'misconduct_target',BASE_NUM,BASE_CAT,BASE_MULTI,
+                 'classification',title=True)
+```
+
+
+### RQ2: Misconduct Classification
+
+**Research Question:** Can publication characteristics predict whether a retraction is classified as misconduct-related, and which features are most influential?
+
+#### Model Performance
+
+Four classification models were compared using PR-AUC, ROC-AUC, and Balanced Accuracy. Since misconduct-related records account for 34.66% of the dataset, PR-AUC was selected as the primary evaluation metric to account for class imbalance.
+
+Extra Trees achieved the best cross-validation performance, with a PR-AUC of 0.8168, ROC-AUC of 0.8831, and Balanced Accuracy of 0.7752, outperforming Random Forest, Logistic Regression, and Dummy Prior.
+
+On the holdout dataset, Extra Trees achieved a PR-AUC of 0.8207, ROC-AUC of 0.8837, F1 Score of 0.7046, and Balanced Accuracy of 0.7732. The consistency between cross-validation and holdout results indicates stable predictive performance under the current data split.
+
+#### Precision–Recall Analysis
+
+The Precision–Recall curve remains substantially above the baseline prevalence of 0.3466, demonstrating the model's ability to distinguish misconduct-related records from other retractions.
+
+Precision remains relatively high at moderate recall levels but decreases as recall approaches 1. This reflects the trade-off between identifying more misconduct-related records and increasing false positives. Adjusting the classification threshold may improve performance depending on the research objective.
+
+#### Feature Importance
+
+Permutation importance identifies Publisher (0.2408) as the strongest predictor, followed by Journal (0.1314), Subject Areas (0.0862), Article Type (0.0536), and Publication Year (0.0530).
+
+These findings suggest that publishing characteristics and disciplinary context are strongly associated with misconduct-related retraction classifications. Country and title-related features contribute comparatively less predictive information.
+
+However, feature importance reflects predictive associations rather than causal relationships, and correlated variables may share predictive information.
+
+#### Limitations and Conclusion
+
+The analysis is limited to already retracted publications and therefore cannot estimate misconduct risk among all published papers. Additionally, the interpretation depends on how the misconduct labels were constructed. Potential target leakage and differences in publisher-specific reporting practices must also be considered.
+
+Overall, Extra Trees is the strongest model for RQ2, demonstrating good classification performance. Publisher, Journal, and Subject Areas emerge as the most influential predictors, highlighting systematic differences in recorded misconduct-related retraction patterns across publishing environments.
+
+
+
+
+
+
+## 7. RQ3 — Which Records Have Data-Related Retraction Reasons?
+
+**Target:** whether any listed reason contains the word `data` (case-insensitive). This is a transparent keyword-defined operational target, not an exhaustive ontology of data integrity problems. We exclude all reason text and misconduct status to avoid target leakage. PR-AUC is primary; prevalence provides a baseline.
+
+```{python}
+df['data_reason_target']=df['retraction_reasons'].map(
+    lambda v:int(any(re.search(r'\bdata\b',x,re.I) for x in split_labels(v))))
+print('Data-related reason prevalence:',df['data_reason_target'].mean())
+if df['data_reason_target'].nunique()<2:
+    print('RQ3 cannot be answered: only one target class exists.')
+else:
+    rq3=run_question('RQ3',df,'data_reason_target',BASE_NUM,BASE_CAT,BASE_MULTI,
+                     'classification',title=True)
+```
+
+
+### RQ3: Data-Related Retraction Classification
+
+**Research Question:** Can publication characteristics predict whether a retraction involves data-related issues, and which features are most influential?
+
+#### Model Performance
+
+Four classification models were evaluated using PR-AUC, ROC-AUC, and Balanced Accuracy. Data-related retractions account for approximately 30.41% of the dataset, making PR-AUC an appropriate primary evaluation metric.
+
+Extra Trees achieved the highest cross-validation PR-AUC (0.8180) and ROC-AUC (0.9128), outperforming Random Forest, Logistic Regression, and Dummy Prior. However, Logistic Regression achieved a higher Balanced Accuracy (0.8203), indicating that model selection depends on the evaluation objective.
+
+On the holdout dataset, Extra Trees achieved a PR-AUC of 0.8198, ROC-AUC of 0.9129, F1 Score of 0.7202, and Balanced Accuracy of 0.7955. The consistency between cross-validation and holdout results suggests stable predictive performance under the current data split.
+
+#### Precision–Recall Analysis
+
+The Precision–Recall curve remains substantially above the baseline prevalence of 0.3041, demonstrating strong discrimination between data-related and other retraction records.
+
+Precision remains relatively high at moderate recall levels but declines as recall approaches 1, reflecting the trade-off between identifying more data-related cases and increasing false positives.
+
+#### Feature Importance
+
+Permutation importance identifies Publisher (0.3030) as the strongest predictor, followed by Subject Areas (0.1266), Journal (0.1060), Publication Year (0.0650), and Article Type (0.0614).
+
+These findings suggest that publishing characteristics and disciplinary context are closely associated with data-related retraction classifications. Title, country, and authorship-related features provide comparatively limited additional predictive information.
+
+However, feature importance measures predictive contribution rather than causal influence.
+
+#### Comparison with RQ2
+
+Compared with RQ2 (Misconduct Classification), RQ3 achieved higher holdout ROC-AUC (0.9129 vs. 0.8837), F1 Score (0.7202 vs. 0.7046), and Balanced Accuracy (0.7955 vs. 0.7732). PR-AUC values were similar, although differences in class prevalence should be considered when comparing the tasks.
+
+Both analyses identify Publisher, Journal, and Subject Areas as influential predictors, suggesting that publication characteristics play an important role in distinguishing recorded retraction categories.
+
+#### Conclusion and Limitations
+
+Overall, Extra Trees is the strongest model for RQ3 under the primary PR-AUC criterion, demonstrating strong classification performance.
+
+Publisher, Subject Areas, and Journal emerge as the most influential predictors of data-related retraction classifications. However, the results are limited to already retracted publications and depend on how data-related labels were defined. Potential target leakage, correlated predictors, and differences in reporting practices should be considered when interpreting these findings.
+
+
+
+
+
+
+
+## 8. RQ4 — Do Biomedical and Other Subjects Have Distinct Metadata Profiles?
+
+This question asks whether metadata *other than subject labels* distinguish biomedical/health-related primary subjects from other subjects. It is not an estimate of disciplinary retraction rates. The binary target is explicitly defined by the primary-subject prefix `(HSC)`; check the coding convention in the source before drawing substantive conclusions. Subject fields are excluded from inputs. Use PR-AUC as the primary ranking metric and report balanced accuracy for class imbalance.
+
+```{python}
+df['health_subject_target']=df['primary_subject'].fillna('').str.startswith('(HSC)').astype(int)
+print('Health-subject prevalence:',df['health_subject_target'].mean())
+# Deliberately exclude primary_subject, subject_areas, and n_subjects.
+rq4_num=['author_count','publication_year','n_countries','n_article_types','title_word_count']
+rq4_multi=['country_tokens','article_type_tokens']
+if df['health_subject_target'].nunique()<2:
+    print('RQ4 cannot be answered: only one target class exists.')
+else:
+    rq4=run_question('RQ4',df,'health_subject_target',rq4_num,BASE_CAT,rq4_multi,
+                     'classification',title=True)
+```
+
+
+### RQ4: Health-Related Subject Classification
+
+**Research Question:** Can publication characteristics predict whether a retracted paper belongs to a health-related academic subject, and which features are most influential?
+
+#### Model Performance
+
+Four classification models were evaluated using PR-AUC, ROC-AUC, and Balanced Accuracy. Health-related papers account for approximately 13.48% of the dataset, indicating substantial class imbalance.
+
+Logistic Regression achieved the best cross-validation performance, with a PR-AUC of 0.7574, ROC-AUC of 0.9402, and Balanced Accuracy of 0.8693, outperforming Extra Trees, Random Forest, and Dummy Prior.
+
+On the holdout dataset, Logistic Regression achieved a PR-AUC of 0.7564, ROC-AUC of 0.9389, F1 Score of 0.6664, and Balanced Accuracy of 0.8695. The consistency between cross-validation and holdout results suggests stable predictive performance.
+
+The strong performance of Logistic Regression indicates that linear models can be effective for high-dimensional text-based classification tasks.
+
+#### Precision–Recall Analysis
+
+The Precision–Recall curve remains substantially above the baseline prevalence of 0.1348, demonstrating strong discrimination between health-related and other retracted publications.
+
+Precision remains relatively high at moderate recall levels but decreases as recall approaches 1. Although ROC-AUC is high, the F1 Score of 0.6664 indicates that classification performance at the default threshold of 0.5 could potentially be improved through threshold optimization.
+
+#### Feature Importance
+
+Permutation importance identifies Title (0.3533) as the strongest predictor, followed by Journal (0.1244), Publisher (0.0468), and Article Type (0.0338).
+
+The dominance of Title suggests that article terminology provides substantial information about academic subject classification. Journal also contributes strongly, likely reflecting the specialized disciplinary focus of many academic publications.
+
+Country, Publication Year, and Author Count provide comparatively limited additional predictive information.
+
+#### Comparison with Previous Research Questions
+
+Unlike RQ2 and RQ3, where Extra Trees performed best and Publisher was the most influential feature, RQ4 favors Logistic Regression and relies primarily on Title and Journal.
+
+This demonstrates that optimal model selection and feature importance depend on the specific prediction task and underlying feature structure.
+
+#### Limitations and Conclusion
+
+The classification results depend on how health-related subjects are defined. Features directly used to construct the target label must be excluded to avoid target leakage.
+
+Furthermore, this analysis identifies subject classification patterns among already retracted publications. It does not establish whether health-related research has a higher retraction rate than other academic fields.
+
+Overall, Logistic Regression is the strongest model for RQ4, demonstrating effective health-related subject classification. Title and Journal emerge as the most influential predictors, highlighting the importance of textual content and publication context in identifying academic disciplines.
+
+
+
+
+
+## 9. RQ5 — Cluster Profiles of Retracted Publications
+
+K-means uses **scaled numeric publication and retraction characteristics** and compressed multi-label fields; it does not use misconduct status, reason labels, DOI or author names to define clusters. The elbow (inertia) and silhouette are both inspected. Silhouette is estimated on a random sample for tractability. Rather than blindly maximizing silhouette, we choose a k with a meaningful elbow and reasonably good separation, then inspect cluster size and profiles. The method is exploratory and clusters are not causal groups.
+
+```{python}
+cluster_cols=['author_count','publication_year','n_subjects','n_countries',
+              'n_article_types','title_word_count']
+cluster_df=df.loc[df['computed_days'].ge(0)].copy()
+cluster_df['log_delay']=np.log1p(cluster_df['computed_days'])
+cluster_cols+=['log_delay']
+# Use bounded multi-label indicators to retain co-occurring labels.
+parts=[]
+for col in ['subject_areas','article_type','country']:
+    labels=cluster_df[col].map(split_labels)
+    freq=pd.Series([x for items in labels for x in items]).value_counts()
+    common=set(freq.head(35).index)
+    mlb=MultiLabelBinarizer(classes=sorted(common))
+    block=mlb.fit_transform(labels.map(lambda a:[x for x in a if x in common]))
+    parts.append(pd.DataFrame(block,index=cluster_df.index,
+                              columns=[col+'__'+x for x in mlb.classes_]))
+num=cluster_df[cluster_cols].replace([np.inf,-np.inf],np.nan)
+num=pd.DataFrame(SimpleImputer(strategy='median').fit_transform(num),
+                 columns=cluster_cols,index=cluster_df.index)
+cluster_features=pd.concat([num]+parts,axis=1)
+Z=StandardScaler().fit_transform(cluster_features).astype('float32')
+# Cap fitting size for reproducible runtime, then assign all rows to centroids.
+rng=np.random.default_rng(RANDOM_STATE)
+fit_idx=rng.choice(len(Z),size=min(12000,len(Z)),replace=False)
+Z_fit=Z[fit_idx]
+ks=list(range(2,9)); inertia=[]; silhouettes=[]
+for k in ks:
+    km=KMeans(n_clusters=k,random_state=RANDOM_STATE,n_init=10,max_iter=200).fit(Z_fit)
+    inertia.append(km.inertia_)
+    silhouettes.append(silhouette_score(Z_fit,km.labels_,sample_size=min(2500,len(Z_fit)),
+                                         random_state=RANDOM_STATE))
+fig,ax=plt.subplots(1,2,figsize=(11,4))
+ax[0].plot(ks,inertia,'o-');ax[0].set(xlabel='k',ylabel='Inertia',title='Elbow method')
+ax[1].plot(ks,silhouettes,'o-');ax[1].set(xlabel='k',ylabel='Sample silhouette',title='Silhouette by k')
+plt.tight_layout();plt.show()
+selection=pd.DataFrame({'k':ks,'inertia':inertia,'silhouette':silhouettes})
+selection['relative_inertia_drop']=(-selection['inertia'].diff()/selection['inertia'].shift(1))
+display(selection)
+# Heuristic: identify the first k where incremental inertia improvement levels off,
+# then prefer a silhouette near the best. The graph and cluster sizes must be reviewed.
+relative_drops=np.array([(inertia[i-1]-inertia[i])/inertia[i-1] for i in range(1,len(inertia))])
+elbow_candidates=[ks[i] for i in range(2,len(ks)) if relative_drops[i-1]<0.75*relative_drops[0]]
+elbow_k=elbow_candidates[0] if elbow_candidates else ks[int(np.argmax(silhouettes))]
+near_best=[k for k,s in zip(ks,silhouettes) if s>=max(silhouettes)-0.02]
+chosen_k=min(near_best,key=lambda k:(abs(k-elbow_k),k))
+print('Elbow heuristic:',elbow_k,'| near-best silhouette candidates:',near_best,
+      '| proposed k:',chosen_k)
+# Override after visually reviewing the two plots, if substantively warranted.
+K_OVERRIDE=None
+k_final=K_OVERRIDE if K_OVERRIDE is not None else chosen_k
+final_km=KMeans(n_clusters=k_final,random_state=RANDOM_STATE,n_init=15).fit(Z_fit)
+cluster_df['cluster']=final_km.predict(Z)
+profiles=cluster_df.groupby('cluster').agg(
+    count=('cluster','size'),median_delay_days=('computed_days','median'),
+    mean_author_count=('author_count','mean'),mean_country_count=('n_countries','mean'),
+    mean_subject_count=('n_subjects','mean'),misconduct_share=('misconduct_target','mean'),
+    data_reason_share=('data_reason_target','mean')).round(3)
+display(profiles)
+profiles.to_csv(OUTPUT/'RQ5_cluster_profiles.csv')
+```
+
+
+
+```{python}
+# Visual diagnostic: 2D projection of a random sample,
+# not proof of cluster separation.
+
+plot_idx = rng.choice(
+    len(Z),
+    size=min(3000, len(Z)),
+    replace=False
+)
+
+coords = TruncatedSVD(
+    n_components=2,
+    random_state=RANDOM_STATE
+).fit_transform(Z[plot_idx])
+
+plt.figure(figsize=(9, 6))
+
+sns.scatterplot(
+    x=coords[:, 0],
+    y=coords[:, 1],
+    hue=cluster_df['cluster'].iloc[plot_idx].astype(str),
+    s=15,
+    alpha=0.5,
+    palette='tab10',
+    legend='full'
+)
+
+plt.title('Cluster Visualization (2D SVD - Zoomed)')
+plt.xlabel('SVD Component 1')
+plt.ylabel('SVD Component 2')
+
+# Zoom in on the main cluster region
+plt.xlim(-5, 8)
+plt.ylim(-8, 6)
+
+plt.tight_layout()
+plt.show()
+```
+
+
+
+
+### RQ5: Clustering Analysis of Academic Retractions
+
+**Research Question:** Can retracted academic papers be grouped into distinct clusters based on publication characteristics, and what patterns distinguish these groups?
+
+#### Cluster Selection
+
+K-means clustering was evaluated using both the Elbow Method and Silhouette Score for K values ranging from 2 to 8.
+
+The Elbow Method suggested K = 4, although the inertia curve did not exhibit a clearly defined turning point. The highest Silhouette Score occurred at K = 3 (0.0787), leading to the preliminary selection of three clusters.
+
+However, the low Silhouette Scores across all K values indicate weak cluster separation and substantial overlap among observations.
+
+#### Cluster Characteristics
+
+**Cluster 0: Shorter-Delay, Smaller-Team Retractions**
+
+Cluster 0 contains 44,196 records (67.06%). It has a median retraction delay of 377 days, an average of 3.06 authors, and a data-related retraction share of 21.5%. This cluster is characterized by relatively shorter retraction delays and smaller research teams.
+
+**Cluster 1: Longer-Delay, Larger-Team Retractions**
+
+Cluster 1 contains 21,711 records (32.94%). Its median retraction delay is 828 days, with an average of 6.28 authors and a data-related retraction share of 48.6%.
+
+Compared with Cluster 0, these records have longer retraction delays, larger author teams, and greater representation of data-related retraction reasons.
+
+Interestingly, misconduct shares are similar across the two major clusters (34.3% versus 35.4%), suggesting that their differences are more pronounced in data-related classifications than in overall misconduct labels.
+
+**Cluster 2: Potential Outlier Group**
+
+Cluster 2 contains only two records, with a median retraction delay of 1,993.5 days. Its extremely small size suggests that it may represent unusual observations rather than a meaningful subgroup.
+
+Consequently, this cluster should not be interpreted as a representative category without further investigation.
+
+#### Interpretation and Limitations
+
+The clustering results reveal differences in retraction delays, authorship characteristics, and data-related retraction patterns, particularly between Clusters 0 and 1.
+
+However, the maximum Silhouette Score of 0.0787 indicates weak separation, while the two-record third cluster raises concerns about cluster stability and interpretability.
+
+Further analysis should examine outliers, feature scaling, and alternative K values. In particular, K = 2 should be evaluated as a potentially simpler and more interpretable solution.
+
+#### Conclusion
+
+K = 3 provides a preliminary clustering solution based on the highest Silhouette Score, but the current results do not establish three robust or clearly separated groups.
+
+The most meaningful distinction appears between a larger group with shorter retraction delays and smaller author teams and a second group with longer delays, larger teams, and higher data-related retraction shares.
+
+Additional validation is recommended before selecting the final clustering structure.
+
+
+
